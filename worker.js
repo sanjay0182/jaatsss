@@ -182,32 +182,33 @@ export default {
     const qq = url.searchParams.get("q");        // referer, hidden the same way as the url (old links used plain r=)
     let r0 = (qq ? await decU(env, qq) : url.searchParams.get("r")) || env.DEFAULT_REF || "https://netfilm.world/";
     if (!safeUrl(r0)) r0 = env.DEFAULT_REF || "https://netfilm.world/";
-    // try with Referer+Origin, then Referer only, then no extra headers (some CDNs answer 502/403 to one of these)
+    // The Python server (httpx) sends: UA, Accept, Referer, Origin, Accept-Encoding "gzip, deflate" and gets 206.
+    // So try that EXACT set first, then a few variants (each try is noted as status:server in X-Jf-Tries).
     const rg = req.headers.get("Range");
-    const mk = (withOrigin, withRef) => {
-      const hh = new Headers({ "User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "identity" });
-      if (withRef) hh.set("Referer", r0);
-      if (withOrigin) hh.set("Origin", new URL(r0).origin);
+    const mk = (o, r, ae) => {
+      const hh = new Headers({ "User-Agent": UA, "Accept": "*/*" });
+      if (ae) hh.set("Accept-Encoding", ae);
+      if (r) hh.set("Referer", r0);
+      if (o) hh.set("Origin", new URL(r0).origin);
       if (rg) hh.set("Range", rg);
       return hh;
     };
+    const profiles = [[1, 1, "gzip, deflate"], [1, 1, null], [0, 1, "identity;q=1, *;q=0"], [0, 0, null]];
     let up = null;
-    const tries = [];
-    for (const [o, r] of [[true, true], [false, true], [false, false]]) {
-      try { up = await fetch(u, { method: req.method, headers: mk(o, r), redirect: "follow" }); }
+    const tries = [], dbg = [];
+    for (const [o, r, ae] of profiles) {
+      try { up = await fetch(u, { method: req.method, headers: mk(o, r, ae), redirect: "follow" }); }
       catch (e) { tries.push("err"); up = null; continue; }
-      tries.push(up.status);
+      tries.push(up.status + ":" + (up.headers.get("server") || "-") + (up.headers.get("cf-ray") ? "+ray" : ""));
       if (up.status < 400 || up.status === 416) break;
+      if (env.DEBUG === "1") { try { dbg.push((await up.clone().text()).slice(0, 70).replace(/\s+/g, " ")); } catch {} }
+      if (up.status === 429) break;                 // rate-limited: more tries only make it worse
     }
     const tr = tries.join(",");
     if (!up) return deny(502, "upstream unreachable tries=" + tr, cors);
     if (up.status >= 400 && up.status !== 416) {
       let extra = "";
-      if (env.DEBUG === "1") {          // Worker Settings -> Variables: DEBUG = 1  (shows what the video server really answered)
-        let b = ""; try { b = (await up.text()).slice(0, 90).replace(/\s+/g, " "); } catch {}
-        extra = " | server=" + (up.headers.get("server") || "-") + " ray=" + (up.headers.get("cf-ray") ? 1 : 0) +
-          " retry-after=" + (up.headers.get("retry-after") || "-") + " ct=" + (up.headers.get("content-type") || "-") + " body=" + b;
-      }
+      if (env.DEBUG === "1") extra = " | bodies=" + dbg.join(" ## ");      // Worker Settings -> Variables: DEBUG = 1
       return deny(502, "upstream " + up.status + " tries=" + tr + extra, cors);
     }
 
