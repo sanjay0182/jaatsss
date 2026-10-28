@@ -1,0 +1,7 @@
+name = "jaatflix-video"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+# dashboard mein jo Variables / Secrets daale hain (LINK_SECRET, ALLOW_ORIGIN) deploy par mitenge nahi
+keep_vars = true
