@@ -202,7 +202,13 @@ export default {
     const tr = tries.join(",");
     if (!up) return deny(502, "upstream unreachable tries=" + tr, cors);
     if (up.status >= 400 && up.status !== 416) {
-      return deny(502, "upstream " + up.status + " tries=" + tr, cors);
+      let extra = "";
+      if (env.DEBUG === "1") {          // Worker Settings -> Variables: DEBUG = 1  (shows what the video server really answered)
+        let b = ""; try { b = (await up.text()).slice(0, 90).replace(/\s+/g, " "); } catch {}
+        extra = " | server=" + (up.headers.get("server") || "-") + " ray=" + (up.headers.get("cf-ray") ? 1 : 0) +
+          " retry-after=" + (up.headers.get("retry-after") || "-") + " ct=" + (up.headers.get("content-type") || "-") + " body=" + b;
+      }
+      return deny(502, "upstream " + up.status + " tries=" + tr + extra, cors);
     }
 
     const ct = (up.headers.get("content-type") || "").toLowerCase();
