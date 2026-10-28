@@ -29,6 +29,33 @@ const key = (env) =>
   (keyP ||= crypto.subtle.importKey("raw", enc.encode(env.LINK_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]));
 const sig = async (env, payload, u) =>
   b64u(await crypto.subtle.sign("HMAC", await key(env), enc.encode(payload + "|" + u))).slice(0, 30);
+// ---- the source url is hidden inside the link (e=): url XOR HMAC-SHA256 keystream, same as protect.enc()/dec() ----
+let ekP = null;
+const ekey = (env) =>
+  (ekP ||= crypto.subtle.digest("SHA-256", enc.encode("jf-enc|" + env.LINK_SECRET))
+    .then((d) => crypto.subtle.importKey("raw", d, { name: "HMAC", hash: "SHA-256" }, false, ["sign"])));
+async function keystream(env, nonce, n) {
+  const k = await ekey(env), blocks = Math.ceil(n / 32), out = new Uint8Array(blocks * 32);
+  for (let i = 0; i < blocks; i++) {
+    const m = new Uint8Array(16); m.set(nonce); new DataView(m.buffer).setUint32(12, i);
+    out.set(new Uint8Array(await crypto.subtle.sign("HMAC", k, m)), i * 32);
+  }
+  return out;
+}
+async function encU(env, u) {
+  const b = enc.encode(u), nonce = crypto.getRandomValues(new Uint8Array(12)), ks = await keystream(env, nonce, b.length);
+  const o = new Uint8Array(12 + b.length); o.set(nonce);
+  for (let i = 0; i < b.length; i++) o[12 + i] = b[i] ^ ks[i];
+  return b64u(o);
+}
+async function decU(env, e) {
+  try {
+    const raw = Uint8Array.from(unb64(e), (c) => c.charCodeAt(0)), nonce = raw.slice(0, 12), ct = raw.slice(12);
+    const ks = await keystream(env, nonce, ct.length), o = new Uint8Array(ct.length);
+    for (let i = 0; i < ct.length; i++) o[i] = ct[i] ^ ks[i];
+    return new TextDecoder().decode(o);
+  } catch { return ""; }
+}
 const devHash = async (dev) => b64u(await crypto.subtle.digest("SHA-256", enc.encode(dev))).slice(0, 12);
 
 function same(a, b) {                       // constant-time string compare
@@ -124,7 +151,9 @@ export default {
     if (!env.LINK_SECRET) return deny(500, "no secret", cors);
 
     // ---- the wall: signature, expiry, IP, device ----
-    const u = url.searchParams.get("u") || "";
+    let u = url.searchParams.get("u") || "";
+    const eu = url.searchParams.get("e");
+    if (eu) u = await decU(env, eu);
     const t = url.searchParams.get("t") || "";
     const dot = t.indexOf(".");
     if (!u || dot < 1) return deny(403, "bad", cors);
@@ -150,7 +179,8 @@ export default {
     if (!safeUrl(u)) return deny(403, "url", cors);
 
     // ---- fetch the video from upstream ----
-    let r0 = url.searchParams.get("r") || env.DEFAULT_REF || "https://netfilm.world/";
+    const qq = url.searchParams.get("q");        // referer, hidden the same way as the url (old links used plain r=)
+    let r0 = (qq ? await decU(env, qq) : url.searchParams.get("r")) || env.DEFAULT_REF || "https://netfilm.world/";
     if (!safeUrl(r0)) r0 = env.DEFAULT_REF || "https://netfilm.world/";
     // try with Referer+Origin, then Referer only, then no extra headers (some CDNs answer 502/403 to one of these)
     const rg = req.headers.get("Range");
@@ -172,8 +202,7 @@ export default {
     const tr = tries.join(",");
     if (!up) return deny(502, "upstream unreachable tries=" + tr, cors);
     if (up.status >= 400 && up.status !== 416) {
-      let host = ""; try { host = new URL(u).hostname; } catch {}
-      return deny(502, "upstream " + up.status + " host=" + host + " tries=" + tr, cors);
+      return deny(502, "upstream " + up.status + " tries=" + tr, cors);
     }
 
     const ct = (up.headers.get("content-type") || "").toLowerCase();
@@ -183,7 +212,7 @@ export default {
       const base = up.url || u;
       const fix = async (x) => {
         const abs = new URL(x.trim(), base).href;
-        return "/p?u=" + encodeURIComponent(abs) + "&t=" + payload + "." + (await sig(env, payload, abs)) + "&r=" + encodeURIComponent(r0);
+        return "/p?e=" + (await encU(env, abs)) + "&t=" + payload + "." + (await sig(env, payload, abs)) + "&q=" + (await encU(env, r0));
       };
       const lines = await Promise.all(text.split(/\r?\n/).map(async (ln) => {
         if (ln.startsWith("#")) {
