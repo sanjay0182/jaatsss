@@ -124,6 +124,22 @@ function safeUrl(u) {
 const deny = (code, why, cors) => (console.log("deny", code, why),
   new Response("forbidden (" + why + ")", { status: code, headers: new Headers({ ...(cors || {}), "Cache-Control": "no-store" }) }));
 
+// DEBUG=1 only: what did the video server say, which colo are we in, and which ips does Cloudflare's resolver give for the video host
+async function dbgInfo(req, up, u, bodies) {
+  const o = ["colo=" + ((req.cf && req.cf.colo) || "-")];
+  try { o.push("final=" + new URL(up.url || u).hostname + (up.redirected ? "(redirected)" : "")); } catch {}
+  const hs = [];
+  for (const k of ["server", "cf-ray", "cf-mitigated", "retry-after", "via", "x-cache", "location", "content-type"]) { const v = up.headers.get(k); if (v) hs.push(k + "=" + v); }
+  o.push("hdr=[" + hs.join(";") + "]");
+  try {
+    const r = await fetch("https://cloudflare-dns.com/dns-query?name=" + new URL(u).hostname + "&type=A", { headers: { Accept: "application/dns-json" } });
+    const j = await r.json();
+    o.push("dns=" + ((j.Answer || []).map((a) => a.data).join(",") || "none"));
+  } catch { o.push("dns=err"); }
+  o.push("bodies=" + bodies.join(" ## "));
+  return o.join(" | ");
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
@@ -208,7 +224,7 @@ export default {
     if (!up) return deny(502, "upstream unreachable tries=" + tr, cors);
     if (up.status >= 400 && up.status !== 416) {
       let extra = "";
-      if (env.DEBUG === "1") extra = " | bodies=" + dbg.join(" ## ");      // Worker Settings -> Variables: DEBUG = 1
+      if (env.DEBUG === "1") extra = " | " + await dbgInfo(req, up, u, dbg);      // Worker Settings -> Variables: DEBUG = 1
       return deny(502, "upstream " + up.status + " tries=" + tr + extra, cors);
     }
 
