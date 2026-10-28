@@ -111,7 +111,7 @@ export default {
     const cors = {
       "Access-Control-Allow-Origin": origin || "*",
       "Vary": "Origin",
-      "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
+      "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, X-Jf-Tries",
     };
     if (req.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: { ...cors,
@@ -152,12 +152,29 @@ export default {
     // ---- fetch the video from upstream ----
     let r0 = url.searchParams.get("r") || env.DEFAULT_REF || "https://netfilm.world/";
     if (!safeUrl(r0)) r0 = env.DEFAULT_REF || "https://netfilm.world/";
-    const h = new Headers({ "User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "identity", "Referer": r0, "Origin": new URL(r0).origin });
+    // try with Referer+Origin, then Referer only, then no extra headers (some CDNs answer 502/403 to one of these)
     const rg = req.headers.get("Range");
-    if (rg) h.set("Range", rg);
-    let up;
-    try { up = await fetch(u, { method: req.method, headers: h, redirect: "follow" }); }
-    catch { return deny(502, "upstream", cors); }
+    const mk = (withOrigin, withRef) => {
+      const hh = new Headers({ "User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "identity" });
+      if (withRef) hh.set("Referer", r0);
+      if (withOrigin) hh.set("Origin", new URL(r0).origin);
+      if (rg) hh.set("Range", rg);
+      return hh;
+    };
+    let up = null;
+    const tries = [];
+    for (const [o, r] of [[true, true], [false, true], [false, false]]) {
+      try { up = await fetch(u, { method: req.method, headers: mk(o, r), redirect: "follow" }); }
+      catch (e) { tries.push("err"); up = null; continue; }
+      tries.push(up.status);
+      if (up.status < 400 || up.status === 416) break;
+    }
+    const tr = tries.join(",");
+    if (!up) return deny(502, "upstream unreachable tries=" + tr, cors);
+    if (up.status >= 400 && up.status !== 416) {
+      let host = ""; try { host = new URL(u).hostname; } catch {}
+      return deny(502, "upstream " + up.status + " host=" + host + " tries=" + tr, cors);
+    }
 
     const ct = (up.headers.get("content-type") || "").toLowerCase();
     if (ct.includes("mpegurl") || u.split("?")[0].endsWith(".m3u8")) {
@@ -187,6 +204,7 @@ export default {
       const v = up.headers.get(k);
       if (v) out.set(k, v);
     }
+    out.set("X-Jf-Tries", tr);
     out.set("Cache-Control", "private, max-age=600");
     return new Response(req.method === "HEAD" ? null : up.body, { status: up.status, headers: out });
   },
