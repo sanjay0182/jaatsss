@@ -124,6 +124,46 @@ function safeUrl(u) {
 const deny = (code, why, cors) => (console.log("deny", code, why),
   new Response("forbidden (" + why + ")", { status: code, headers: new Headers({ ...(cors || {}), "Cache-Control": "no-store" }) }));
 
+// ---- WORKER_RESOLVE: the Worker asks MovieBox for the signed video link ITSELF (same IP for link and video) ----
+const MB_API = "https://h5-api.aoneroom.com/wefeed-h5api-bff";
+const MB_HDR = { "User-Agent": UA, "Accept": "application/json", "X-Request-Lang": "en", "X-Client-Info": '{"timezone":"Asia/Kolkata"}', "Accept-Language": "en-IN,en;q=0.9" };
+let mbTok = { v: "", t: 0 };
+const mbCache = new Map();
+async function mbToken(env, force) {
+  if (!force && mbTok.v && Date.now() - mbTok.t < 600000) return mbTok.v;
+  try {
+    const r = await fetch((env.MB_API || MB_API) + "/home?host=" + (env.MB_HOST || "moviebox.ph"), { headers: { ...MB_HDR, "Referer": "https://moviebox.ph/", "Origin": "https://moviebox.ph", "Content-Type": "application/json" } });
+    const j = JSON.parse(r.headers.get("x-user") || "{}");
+    if (j.token) mbTok = { v: j.token, t: Date.now() };
+  } catch {}
+  return mbTok.v;
+}
+async function mbResolve(env, sp) {                     // -> upstream video url ("" on failure)
+  const ck = JSON.stringify(sp), hit = mbCache.get(ck);
+  if (hit && Date.now() - hit.t < 900000) return hit.u;
+  const dom = String(sp.dom || "").replace(/\/+$/, "");
+  if (!safeUrl(dom)) return "";
+  const q = "subjectId=" + encodeURIComponent(sp.s) + "&se=" + (+sp.se || 0) + "&ep=" + (+sp.ep || 0) + "&detailPath=" + encodeURIComponent(sp.d);
+  const ref = dom + "/spa/videoPlayPage/movies/" + sp.d + "?id=" + sp.s + "&type=/movie/detail&detailSe=" + (+sp.se || 0) + "&detailEp=" + (+sp.ep || 0) + "&lang=en";
+  for (let a = 0; a < 2; a++) {
+    const tk = await mbToken(env, a > 0);
+    let r;
+    try { r = await fetch(dom + "/wefeed-h5api-bff/subject/play?" + q, { headers: { ...MB_HDR, "Referer": ref, ...(tk ? { "Authorization": "Bearer " + tk } : {}) } }); } catch { return ""; }
+    if ((r.status === 401 || r.status === 403) && a === 0) continue;
+    let d; try { d = ((await r.json()) || {}).data || {}; } catch { return ""; }
+    let u = "";
+    if (sp.l === "hls") { const x = (d.hls || [])[sp.n]; u = (x && (x.url || x)) || ""; }
+    else {
+      const st = d.streams || [];
+      const x = st.find((s) => s.url && (+s.resolutions || 0) === sp.r && s.url.includes(".m3u8") === !!sp.m) || st[sp.n];
+      u = (x && x.url) || "";
+    }
+    if (typeof u === "string" && u) { mbCache.set(ck, { u, t: Date.now() }); if (mbCache.size > 200) mbCache.delete(mbCache.keys().next().value); return u; }
+    return "";
+  }
+  return "";
+}
+
 // DEBUG=1 only: what did the video server say, which colo are we in, and which ips does Cloudflare's resolver give for the video host
 async function dbgInfo(req, up, u, bodies) {
   const o = ["colo=" + ((req.cf && req.cf.colo) || "-")];
@@ -191,6 +231,11 @@ export default {
     if (env.DEV_CHECK !== "0" && p.d) {
       const dev = req.headers.get("X-Device") || "";
       if (!DEV_RE.test(dev) || !same(await devHash(dev), String(p.d))) return deny(403, "device", cors);
+    }
+    if (u.startsWith("mb:")) {
+      let sp; try { sp = JSON.parse(u.slice(3)); } catch { return deny(403, "bad", cors); }
+      u = await mbResolve(env, sp);
+      if (!u) return deny(502, "resolve failed", cors);
     }
     if (!safeUrl(u)) return deny(403, "url", cors);
 
