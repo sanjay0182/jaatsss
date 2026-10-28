@@ -94,8 +94,8 @@ function safeUrl(u) {
   } catch { return false; }
 }
 
-const deny = (code, why, cors) =>
-  new Response("forbidden (" + why + ")", { status: code, headers: new Headers({ ...(cors || {}), "Cache-Control": "no-store" }) });
+const deny = (code, why, cors) => (console.log("deny", code, why),
+  new Response("forbidden (" + why + ")", { status: code, headers: new Headers({ ...(cors || {}), "Cache-Control": "no-store" }) }));
 
 export default {
   async fetch(req, env) {

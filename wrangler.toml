@@ -5,3 +5,6 @@ workers_dev = true
 
 # dashboard mein jo Variables / Secrets daale hain (LINK_SECRET, ALLOW_ORIGIN) deploy par mitenge nahi
 keep_vars = true
+
+[observability]
+enabled = true
