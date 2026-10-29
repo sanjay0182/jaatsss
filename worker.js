@@ -7,11 +7,14 @@
 //   DEV_CHECK     optional   "0" = do not compare X-Device with the link's device
 //   IP_FAMILY_STRICT optional "1" = also refuse when the link was made on IPv4 but is used on IPv6 (or the reverse)
 //   DEFAULT_REF   optional   fallback Referer for the upstream (default https://netfilm.world/)
-//   PROXY         optional   HTTP proxy for the upstream calls:  host:port  or  http://user:pass@host:port
-//                            (not set = the DEFAULT_PROXY written in this file, below).  No port given = the common
-//                            proxy ports are tried (PROXY_PORTS, default 8080,3128,80,8888,3129,8000) and the first that works is kept.
-//   PROXY_MODE    optional   "always" (default) = every upstream call goes through the proxy, the Worker's own IP is never used
-//                            "fallback" = go direct, use the proxy only when direct gives 429 / 403 / 503 / error | "off" = no proxy
+//   PROXY         optional   HTTP proxies for the upstream calls, several allowed (comma / space / new line separated), each as
+//                            ip:port:user:pass   or   http://user:pass@ip:port   or   ip:port
+//                            (not set = the DEFAULT_PROXIES list written in this file, below).
+//                            A link always uses the SAME proxy (chosen from its token), so the signed video link and the video bytes
+//                            come from one IP; if that proxy is dead / blocked (429, 403, 503) the next proxy is tried.
+//   PROXY_MODE    optional   "always" (default) = every upstream call goes through a proxy, the Worker's own IP is never used
+//                            "fallback" = go direct, use the proxies only when direct gives 429 / 403 / 503 / error | "off" = no proxy
+//   PROXY_TRIES   optional   how many different proxies one call may try (default 3)
 //
 // A link is  /p?u=<video url>&t=<token>&r=<referer>   (made by api.py / protect.py)
 
@@ -137,7 +140,9 @@ const deny = (code, why, cors) => (console.log("deny", code, why),
 //   https target:  CONNECT host:443  ->  startTls  ->  plain HTTP/1.1 request on the tunnel
 //   http  target:  request with the full URL sent to the proxy
 // Only HTTP proxies (optionally with user:pass).  SOCKS and https:// proxies are not supported.
-const DEFAULT_PROXY = "143.244.130.180";       // the proxy under test: "ip" or "ip:port" or "http://user:pass@ip:port"  (env PROXY wins)
+const DEFAULT_PROXIES = [                      // ip:port:user:pass   (env PROXY wins)
+  "45.38.107.97:6014:pifpgtdg:2dnuiyauxt6y",   // the only one of the 10 that answered (the others: 402 Payment Required / 407)
+];
 const CRLF = new Uint8Array([13, 10]), CRLF2 = new Uint8Array([13, 10, 13, 10]);
 const txt = (b) => new TextDecoder().decode(b);
 function idx(buf, seq) {
@@ -169,18 +174,25 @@ class Rd {                                     // small buffered reader over a R
     const o = this.buf.slice(0, n); this.buf = this.buf.slice(o.length); return o;
   }
 }
-function parseProxy(env) {
-  let s = String(env.PROXY || DEFAULT_PROXY || "").trim();
+function parseProxy(s, env) {
+  s = String(s || "").trim();
   if (!s) return null;
-  if (!/^[a-z]+:\/\//i.test(s)) s = "http://" + s;
+  const f = s.split(":");
+  if (!/^[a-z]+:\/\//i.test(s) && f.length === 4) s = "http://" + encodeURIComponent(f[2]) + ":" + encodeURIComponent(f[3]) + "@" + f[0] + ":" + f[1];   // ip:port:user:pass
+  else if (!/^[a-z]+:\/\//i.test(s)) s = "http://" + s;
   try {
     const p = new URL(s);
     if (p.protocol !== "http:" || !p.hostname) return null;
     return { host: p.hostname, port: +p.port || 0,
-      ports: String(env.PROXY_PORTS || "8080,3128,80,8888,3129,8000").split(",").map((x) => +x.trim()).filter((x) => x > 0 && x < 65536),
+      ports: String((env && env.PROXY_PORTS) || "8080,3128,80,8888,3129,8000").split(",").map((x) => +x.trim()).filter((x) => x > 0 && x < 65536),
       auth: p.username ? "Basic " + btoa(decodeURIComponent(p.username) + ":" + decodeURIComponent(p.password)) : "" };
   } catch { return null; }
 }
+function proxyList(env) {
+  const raw = env.PROXY ? String(env.PROXY).split(/[\s,;]+/) : DEFAULT_PROXIES;
+  return raw.map((x) => parseProxy(x, env)).filter(Boolean);
+}
+const hash32 = (str) => { let h = 2166136261; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
 const tmo = (p, ms, what) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error(what + " timeout")), ms))]);
 async function headOf(rd) {                    // -> {status, headers}
   const lines = txt(await rd.until(CRLF2, 65536)).split("\r\n");
@@ -275,22 +287,29 @@ async function proxyFetchOnce(px, url, init, hop) {
     return resp;
   } catch (e) { close(); throw e; }
 }
-// every call to the video side goes through here (PROXY unset = plain fetch, nothing changes)
-async function upFetch(env, url, init) {
-  const px = parseProxy(env), mode = String(env.PROXY_MODE || "always").toLowerCase();
-  if (!px || mode === "off") return fetch(url, init);
-  if (mode === "always") return proxyFetch(px, url, init);
-  let r = null;
-  try { r = await fetch(url, init); } catch {}
-  if (r && ![429, 403, 503].includes(r.status)) return r;
-  try {
-    const p = await proxyFetch(px, url, init);
-    if (r) { try { await r.body?.cancel(); } catch {} }
-    return p;
-  } catch (e) {
-    if (r) return r;                           // the proxy is down too: give back what direct said
-    throw e;
+// every call to the video side goes through here (no proxy / PROXY_MODE=off = plain fetch, nothing changes)
+// key = the link's token: the same link always starts with the same proxy (one IP for the signed link and the video)
+const bad = (r) => [429, 403, 503].includes(r.status);
+async function upFetch(env, url, init, key) {
+  const list = proxyList(env), mode = String(env.PROXY_MODE || "always").toLowerCase();
+  if (!list.length || mode === "off") return fetch(url, init);
+  const start = hash32(String(key || "")) % list.length, tries = Math.max(1, Math.min(list.length, +env.PROXY_TRIES || 3));
+  let first = null;
+  if (mode === "fallback") {
+    try { first = await fetch(url, init); } catch {}
+    if (first && !bad(first)) return first;
   }
+  let last = null, err = null;
+  for (let i = 0; i < tries; i++) {
+    let r;
+    try { r = await proxyFetch(list[(start + i) % list.length], url, init); } catch (e) { err = e; continue; }
+    if (!bad(r)) { if (first) { try { await first.body?.cancel(); } catch {} } return r; }
+    if (last) { try { await last.body?.cancel(); } catch {} }
+    last = r;                                    // blocked through this proxy: try the next one
+  }
+  if (first) { try { await last?.body?.cancel(); } catch {} return first; }
+  if (last) return last;
+  throw err || new Error("no proxy worked");
 }
 
 // ---- WORKER_RESOLVE: the Worker asks MovieBox for the signed video link ITSELF (same IP for link and video) ----
@@ -298,16 +317,16 @@ const MB_API = "https://h5-api.aoneroom.com/wefeed-h5api-bff";
 const MB_HDR = { "User-Agent": UA, "Accept": "application/json", "X-Request-Lang": "en", "X-Client-Info": '{"timezone":"Asia/Kolkata"}', "Accept-Language": "en-IN,en;q=0.9" };
 let mbTok = { v: "", t: 0 };
 const mbCache = new Map();
-async function mbToken(env, force) {
+async function mbToken(env, force, key) {
   if (!force && mbTok.v && Date.now() - mbTok.t < 600000) return mbTok.v;
   try {
-    const r = await upFetch(env, (env.MB_API || MB_API) + "/home?host=" + (env.MB_HOST || "moviebox.ph"), { headers: { ...MB_HDR, "Referer": "https://moviebox.ph/", "Origin": "https://moviebox.ph", "Content-Type": "application/json" } });
+    const r = await upFetch(env, (env.MB_API || MB_API) + "/home?host=" + (env.MB_HOST || "moviebox.ph"), { headers: { ...MB_HDR, "Referer": "https://moviebox.ph/", "Origin": "https://moviebox.ph", "Content-Type": "application/json" } }, key);
     const j = JSON.parse(r.headers.get("x-user") || "{}");
     if (j.token) mbTok = { v: j.token, t: Date.now() };
   } catch {}
   return mbTok.v;
 }
-async function mbResolve(env, sp) {                     // -> upstream video url ("" on failure)
+async function mbResolve(env, sp, key) {                     // -> upstream video url ("" on failure)
   const ck = JSON.stringify(sp), hit = mbCache.get(ck);
   if (hit && Date.now() - hit.t < 900000) return hit.u;
   const dom = String(sp.dom || "").replace(/\/+$/, "");
@@ -315,9 +334,9 @@ async function mbResolve(env, sp) {                     // -> upstream video url
   const q = "subjectId=" + encodeURIComponent(sp.s) + "&se=" + (+sp.se || 0) + "&ep=" + (+sp.ep || 0) + "&detailPath=" + encodeURIComponent(sp.d);
   const ref = dom + "/spa/videoPlayPage/movies/" + sp.d + "?id=" + sp.s + "&type=/movie/detail&detailSe=" + (+sp.se || 0) + "&detailEp=" + (+sp.ep || 0) + "&lang=en";
   for (let a = 0; a < 2; a++) {
-    const tk = await mbToken(env, a > 0);
+    const tk = await mbToken(env, a > 0, key);
     let r;
-    try { r = await upFetch(env, dom + "/wefeed-h5api-bff/subject/play?" + q, { headers: { ...MB_HDR, "Referer": ref, ...(tk ? { "Authorization": "Bearer " + tk } : {}) } }); } catch { return ""; }
+    try { r = await upFetch(env, dom + "/wefeed-h5api-bff/subject/play?" + q, { headers: { ...MB_HDR, "Referer": ref, ...(tk ? { "Authorization": "Bearer " + tk } : {}) } }, key); } catch { return ""; }
     if ((r.status === 401 || r.status === 403) && a === 0) continue;
     let d; try { d = ((await r.json()) || {}).data || {}; } catch { return ""; }
     let u = "";
@@ -403,7 +422,7 @@ export default {
     }
     if (u.startsWith("mb:")) {
       let sp; try { sp = JSON.parse(u.slice(3)); } catch { return deny(403, "bad", cors); }
-      u = await mbResolve(env, sp);
+      u = await mbResolve(env, sp, payload);
       if (!u) return deny(502, "resolve failed", cors);
     }
     if (!safeUrl(u)) return deny(403, "url", cors);
@@ -427,7 +446,7 @@ export default {
     let up = null;
     const tries = [], dbg = [];
     for (const [o, r, ae] of profiles) {
-      try { up = await upFetch(env, u, { method: req.method, headers: mk(o, r, ae), redirect: "follow" }); }
+      try { up = await upFetch(env, u, { method: req.method, headers: mk(o, r, ae), redirect: "follow" }, payload); }
       catch (e) { tries.push("err"); up = null; continue; }
       tries.push(up.status + ":" + (up.headers.get("server") || "-") + (up.headers.get("cf-ray") ? "+ray" : "") + (up.viaProxy ? "+px" : ""));
       if (up.status < 400 || up.status === 416) break;
