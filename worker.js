@@ -306,10 +306,42 @@ async function proxyFetchOnce(px, url, init, hop) {
 }
 // every call to the video side goes through here (no proxy / PROXY_MODE=off = plain fetch, nothing changes)
 // key = the link's token: the same link always starts with the same proxy (one IP for the signed link and the video)
+// ---- direct raw socket (no proxy): a plain TLS connection from this Worker, NOT fetch().  fetch() to a site that sits behind Cloudflare is
+// tagged as a Worker request and the video host answers 427 to it; a raw socket looks like an ordinary client (this is also what the VLESS tunnel does).
+async function sockFetch(url, init, hop) {
+  init = init || {};
+  const u = new URL(url), tls = u.protocol === "https:", port = +u.port || (tls ? 443 : 80), method = init.method || "GET";
+  const hd = new Headers(init.headers || {});
+  hd.set("Host", u.host); hd.set("Accept-Encoding", "identity"); hd.set("Connection", "close");
+  const sock = connect({ hostname: u.hostname, port }, { secureTransport: tls ? "on" : "off" });
+  const close = () => { try { sock.close(); } catch {} };
+  try {
+    const w = sock.writable.getWriter(), rd = new Rd(sock.readable);
+    let req = method + " " + (u.pathname + u.search) + " HTTP/1.1\r\n";
+    for (const [k, v] of hd) req += k + ": " + v + "\r\n";
+    await w.write(enc.encode(req + "\r\n"));
+    const head = await tmo(headOf(rd), 20000, "socket response");
+    if ([301, 302, 303, 307, 308].includes(head.status) && head.headers.get("location") && hop < 4 && init.redirect !== "manual") {
+      close();
+      return sockFetch(new URL(head.headers.get("location"), u).href, init, hop + 1);
+    }
+    const resp = new Response(bodyOf(rd, head, close, method, () => sock.readable), { status: head.status, headers: head.headers });
+    Object.defineProperty(resp, "url", { value: u.href });
+    Object.defineProperty(resp, "viaSock", { value: true });
+    return resp;
+  } catch (e) { close(); throw e; }
+}
+async function direct(env, url, init) {       // no proxy: video hosts go through a raw socket, everything else through fetch()
+  if (env.RAW_SOCKET !== "0") {
+    let h = ""; try { h = new URL(url).hostname.toLowerCase(); } catch {}
+    if (/(^|\.)hakunaymatata\.com$/.test(h)) { try { return await sockFetch(url, init, 0); } catch {} }
+  }
+  return fetch(url, init);
+}
 const bad = (r) => [429, 403, 503].includes(r.status);
 async function upFetch(env, url, init, key) {
   const list = proxyList(env), mode = String(env.PROXY_MODE || "off").toLowerCase();
-  if (!list.length || mode === "off") return fetch(url, init);
+  if (!list.length || mode === "off") return direct(env, url, init);
   const start = hash32(String(key || "")) % list.length, tries = Math.max(1, Math.min(list.length, +env.PROXY_TRIES || 3));
   let first = null;
   if (mode === "fallback") {
@@ -455,10 +487,17 @@ async function selfTest(req, env) {
         const r = await upFetch(env, dom + "/wefeed-h5api-bff/subject/download?" + q, { headers: { ...MB_HDR, "Referer": ref, "Authorization": "Bearer " + tok } }, "t");
         const dl = ((((await r.json().catch(() => ({}))) || {}).data || {}).downloads || []).filter((x) => x && x.url);
         if (!dl.length) return r.status + " no download link";
-        const x = dl[0], v = await upFetch(env, x.url, { headers: { "User-Agent": UA, "Accept": "*/*", "Referer": dom + "/", "Origin": dom, "Range": "bytes=0-65535" }, redirect: "follow" }, "t");
-        let n = 0;
-        if (v.body) { const rd = v.body.getReader(); for (;;) { const { value, done } = await rd.read(); if (done) break; n += value.length; if (n >= 65536) { await rd.cancel(); break; } } }
-        return r.status + " " + dl.map((y) => y.resolution + "p").join("/") + " | " + new URL(x.url).hostname + " -> " + v.status + " bytes=" + n;
+        const x = dl[0], vh = { "User-Agent": UA, "Accept": "*/*", "Referer": dom + "/", "Origin": dom, "Range": "bytes=0-65535" };
+        const probe = async (fn) => {
+          try {
+            const v = await fn(x.url, { headers: vh, redirect: "follow" });
+            let n = 0;
+            if (v.body) { const rd = v.body.getReader(); for (;;) { const { value, done } = await rd.read(); if (done) break; n += value.length; if (n >= 65536) { await rd.cancel(); break; } } }
+            return v.status + " server=" + (v.headers.get("server") || "-") + " bytes=" + n;
+          } catch (e) { return "ERR " + String((e && e.message) || e).replace(/[^\x20-\x7e]/g, "").slice(0, 60); }
+        };
+        const a = await probe((u2, i2) => fetch(u2, i2)), b = await probe((u2, i2) => sockFetch(u2, i2, 0));
+        return r.status + " " + dl.map((y) => y.resolution + "p").join("/") + " | " + new URL(x.url).hostname + "\n      fetch(): " + a + "\n      socket: " + b;
       });
       await step("4 video 1MB (play link, bcdnxw: 427 here is normal)", async () => {
         const r = await upFetch(env, vid, { headers: { "User-Agent": UA, "Accept": "*/*", "Referer": dom + "/", "Origin": dom, "Range": "bytes=0-1048575" }, redirect: "follow" }, "t");
@@ -555,7 +594,7 @@ export default {
     for (const [o, r, ae] of profiles) {
       try { up = await upFetch(env, u, { method: req.method, headers: mk(o, r, ae), redirect: "follow" }, payload); }
       catch (e) { tries.push("err:" + String((e && e.message) || e).replace(/[^\x20-\x7e]/g, "").slice(0, 60)); up = null; continue; }
-      tries.push(up.status + ":" + (up.headers.get("server") || "-") + (up.headers.get("cf-ray") ? "+ray" : "") + (up.viaProxy ? "+px" : ""));
+      tries.push(up.status + ":" + (up.headers.get("server") || "-") + (up.headers.get("cf-ray") ? "+ray" : "") + (up.viaProxy ? "+px" : "") + (up.viaSock ? "+sk" : ""));
       if (up.status < 400 || up.status === 416) break;
       if (env.DEBUG === "1") { try { dbg.push((await up.clone().text()).slice(0, 70).replace(/\s+/g, " ")); } catch {} }
       if (up.status === 429) break;                 // rate-limited: more tries only make it worse
