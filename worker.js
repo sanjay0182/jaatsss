@@ -7,8 +7,15 @@
 //   DEV_CHECK     optional   "0" = do not compare X-Device with the link's device
 //   IP_FAMILY_STRICT optional "1" = also refuse when the link was made on IPv4 but is used on IPv6 (or the reverse)
 //   DEFAULT_REF   optional   fallback Referer for the upstream (default https://netfilm.world/)
+//   PROXY         optional   HTTP proxy for the upstream calls:  host:port  or  http://user:pass@host:port
+//                            (not set = the DEFAULT_PROXY written in this file, below).  No port given = the common
+//                            proxy ports are tried (PROXY_PORTS, default 8080,3128,80,8888,3129,8000) and the first that works is kept.
+//   PROXY_MODE    optional   "always" (default) = every upstream call goes through the proxy, the Worker's own IP is never used
+//                            "fallback" = go direct, use the proxy only when direct gives 429 / 403 / 503 / error | "off" = no proxy
 //
 // A link is  /p?u=<video url>&t=<token>&r=<referer>   (made by api.py / protect.py)
+
+import { connect } from "cloudflare:sockets";
 
 const enc = new TextEncoder();
 const UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
@@ -124,6 +131,168 @@ function safeUrl(u) {
 const deny = (code, why, cors) => (console.log("deny", code, why),
   new Response("forbidden (" + why + ")", { status: code, headers: new Headers({ ...(cors || {}), "Cache-Control": "no-store" }) }));
 
+
+// ================= upstream through an HTTP proxy (PROXY) =================
+// A Worker cannot use a proxy with fetch(), so we speak to it over a raw TCP socket:
+//   https target:  CONNECT host:443  ->  startTls  ->  plain HTTP/1.1 request on the tunnel
+//   http  target:  request with the full URL sent to the proxy
+// Only HTTP proxies (optionally with user:pass).  SOCKS and https:// proxies are not supported.
+const DEFAULT_PROXY = "143.244.130.180";       // the proxy under test: "ip" or "ip:port" or "http://user:pass@ip:port"  (env PROXY wins)
+const CRLF = new Uint8Array([13, 10]), CRLF2 = new Uint8Array([13, 10, 13, 10]);
+const txt = (b) => new TextDecoder().decode(b);
+function idx(buf, seq) {
+  outer: for (let i = 0; i + seq.length <= buf.length; i++) {
+    for (let j = 0; j < seq.length; j++) if (buf[i + j] !== seq[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+class Rd {                                     // small buffered reader over a ReadableStream of bytes
+  constructor(readable) { this.r = readable.getReader(); this.buf = new Uint8Array(0); this.eof = false; }
+  async fill() {
+    if (this.eof) return false;
+    const { value, done } = await this.r.read();
+    if (done) { this.eof = true; return false; }
+    const n = new Uint8Array(this.buf.length + value.length); n.set(this.buf); n.set(value, this.buf.length); this.buf = n;
+    return true;
+  }
+  async until(seq, max) {                      // bytes before `seq` (seq is consumed)
+    for (;;) {
+      const i = idx(this.buf, seq);
+      if (i >= 0) { const o = this.buf.slice(0, i); this.buf = this.buf.slice(i + seq.length); return o; }
+      if (this.buf.length > max) throw new Error("head too big");
+      if (!(await this.fill())) throw new Error("eof");
+    }
+  }
+  async take(n) {                              // up to n bytes, null at end of stream
+    while (!this.buf.length) if (!(await this.fill())) return null;
+    const o = this.buf.slice(0, n); this.buf = this.buf.slice(o.length); return o;
+  }
+}
+function parseProxy(env) {
+  let s = String(env.PROXY || DEFAULT_PROXY || "").trim();
+  if (!s) return null;
+  if (!/^[a-z]+:\/\//i.test(s)) s = "http://" + s;
+  try {
+    const p = new URL(s);
+    if (p.protocol !== "http:" || !p.hostname) return null;
+    return { host: p.hostname, port: +p.port || 0,
+      ports: String(env.PROXY_PORTS || "8080,3128,80,8888,3129,8000").split(",").map((x) => +x.trim()).filter((x) => x > 0 && x < 65536),
+      auth: p.username ? "Basic " + btoa(decodeURIComponent(p.username) + ":" + decodeURIComponent(p.password)) : "" };
+  } catch { return null; }
+}
+const tmo = (p, ms, what) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error(what + " timeout")), ms))]);
+async function headOf(rd) {                    // -> {status, headers}
+  const lines = txt(await rd.until(CRLF2, 65536)).split("\r\n");
+  const m = /^HTTP\/1\.[01] (\d{3})/.exec(lines[0] || "");
+  if (!m) throw new Error("bad response");
+  const headers = new Headers();
+  for (const l of lines.slice(1)) {
+    const i = l.indexOf(":");
+    if (i > 0) { try { headers.append(l.slice(0, i).trim(), l.slice(i + 1).trim()); } catch {} }
+  }
+  return { status: +m[1], headers };
+}
+function bodyOf(rd, head, close, method) {
+  const st = head.status;
+  if (method === "HEAD" || st === 204 || st === 304 || (st >= 100 && st < 200)) { close(); return null; }
+  const chunked = /chunked/i.test(head.headers.get("transfer-encoding") || "");
+  const cl = head.headers.get("content-length");
+  let left = cl !== null && /^\d+$/.test(cl) ? +cl : -1;
+  return new ReadableStream({
+    async pull(c) {
+      try {
+        if (chunked) {
+          const size = parseInt(txt(await rd.until(CRLF, 128)).split(";")[0].trim(), 16);
+          if (!(size >= 0)) throw new Error("bad chunk");
+          if (size === 0) { c.close(); close(); return; }
+          let n = size;
+          while (n > 0) { const ch = await rd.take(n); if (!ch) throw new Error("short chunk"); c.enqueue(ch); n -= ch.length; }
+          await rd.until(CRLF, 8);
+        } else if (left >= 0) {
+          if (left === 0) { c.close(); close(); return; }
+          const ch = await rd.take(Math.min(65536, left));
+          if (!ch) throw new Error("short body");
+          left -= ch.length; c.enqueue(ch);
+          if (left === 0) { c.close(); close(); }
+        } else {
+          const ch = await rd.take(65536);
+          if (!ch) { c.close(); close(); return; }
+          c.enqueue(ch);
+        }
+      } catch (e) { close(); c.error(e); }
+    },
+    cancel() { close(); },
+  });
+}
+let okPort = 0;                                 // the proxy port that worked last (only used when no port was given)
+async function proxyFetch(px, url, init) {
+  if (px.port) return proxyFetchOnce(px, url, init, 0);
+  const list = okPort ? [okPort, ...px.ports.filter((x) => x !== okPort)] : px.ports;
+  let last = new Error("no proxy port");
+  for (const port of list) {
+    try { const r = await proxyFetchOnce({ ...px, port }, url, init, 0); okPort = port; return r; }
+    catch (e) { last = e; }
+  }
+  throw last;
+}
+async function proxyFetchOnce(px, url, init, hop) {
+  init = init || {};
+  const u = new URL(url), tls = u.protocol === "https:", port = +u.port || (tls ? 443 : 80), method = init.method || "GET";
+  const hd = new Headers(init.headers || {});
+  hd.set("Host", u.host); hd.set("Accept-Encoding", "identity"); hd.set("Connection", "close");
+  let sock = connect({ hostname: px.host, port: px.port }, { secureTransport: tls ? "starttls" : "off" });
+  const close = () => { try { sock.close(); } catch {} };
+  try {
+    let w = sock.writable.getWriter(), rd = new Rd(sock.readable), target;
+    if (tls) {
+      await tmo((async () => {
+        await w.write(enc.encode("CONNECT " + u.hostname + ":" + port + " HTTP/1.1\r\nHost: " + u.hostname + ":" + port + "\r\n" +
+          (px.auth ? "Proxy-Authorization: " + px.auth + "\r\n" : "") + "\r\n"));
+        const h = await headOf(rd);
+        if (h.status !== 200) throw new Error("proxy CONNECT " + h.status);
+        if (rd.buf.length) throw new Error("proxy sent early data");
+      })(), 10000, "proxy connect");
+      w.releaseLock(); rd.r.releaseLock();
+      sock = sock.startTls({ expectedServerHostname: u.hostname });
+      w = sock.writable.getWriter(); rd = new Rd(sock.readable);
+      target = u.pathname + u.search;
+    } else {
+      if (px.auth) hd.set("Proxy-Authorization", px.auth);
+      target = u.href;
+    }
+    let req = method + " " + target + " HTTP/1.1\r\n";
+    for (const [k, v] of hd) req += k + ": " + v + "\r\n";
+    await w.write(enc.encode(req + "\r\n"));
+    const head = await tmo(headOf(rd), 20000, "proxy response");
+    if ([301, 302, 303, 307, 308].includes(head.status) && head.headers.get("location") && hop < 4 && init.redirect !== "manual") {
+      close();
+      return proxyFetchOnce(px, new URL(head.headers.get("location"), u).href, init, hop + 1);
+    }
+    const resp = new Response(bodyOf(rd, head, close, method), { status: head.status, headers: head.headers });
+    Object.defineProperty(resp, "url", { value: u.href });
+    Object.defineProperty(resp, "viaProxy", { value: true });
+    return resp;
+  } catch (e) { close(); throw e; }
+}
+// every call to the video side goes through here (PROXY unset = plain fetch, nothing changes)
+async function upFetch(env, url, init) {
+  const px = parseProxy(env), mode = String(env.PROXY_MODE || "always").toLowerCase();
+  if (!px || mode === "off") return fetch(url, init);
+  if (mode === "always") return proxyFetch(px, url, init);
+  let r = null;
+  try { r = await fetch(url, init); } catch {}
+  if (r && ![429, 403, 503].includes(r.status)) return r;
+  try {
+    const p = await proxyFetch(px, url, init);
+    if (r) { try { await r.body?.cancel(); } catch {} }
+    return p;
+  } catch (e) {
+    if (r) return r;                           // the proxy is down too: give back what direct said
+    throw e;
+  }
+}
+
 // ---- WORKER_RESOLVE: the Worker asks MovieBox for the signed video link ITSELF (same IP for link and video) ----
 const MB_API = "https://h5-api.aoneroom.com/wefeed-h5api-bff";
 const MB_HDR = { "User-Agent": UA, "Accept": "application/json", "X-Request-Lang": "en", "X-Client-Info": '{"timezone":"Asia/Kolkata"}', "Accept-Language": "en-IN,en;q=0.9" };
@@ -132,7 +301,7 @@ const mbCache = new Map();
 async function mbToken(env, force) {
   if (!force && mbTok.v && Date.now() - mbTok.t < 600000) return mbTok.v;
   try {
-    const r = await fetch((env.MB_API || MB_API) + "/home?host=" + (env.MB_HOST || "moviebox.ph"), { headers: { ...MB_HDR, "Referer": "https://moviebox.ph/", "Origin": "https://moviebox.ph", "Content-Type": "application/json" } });
+    const r = await upFetch(env, (env.MB_API || MB_API) + "/home?host=" + (env.MB_HOST || "moviebox.ph"), { headers: { ...MB_HDR, "Referer": "https://moviebox.ph/", "Origin": "https://moviebox.ph", "Content-Type": "application/json" } });
     const j = JSON.parse(r.headers.get("x-user") || "{}");
     if (j.token) mbTok = { v: j.token, t: Date.now() };
   } catch {}
@@ -148,7 +317,7 @@ async function mbResolve(env, sp) {                     // -> upstream video url
   for (let a = 0; a < 2; a++) {
     const tk = await mbToken(env, a > 0);
     let r;
-    try { r = await fetch(dom + "/wefeed-h5api-bff/subject/play?" + q, { headers: { ...MB_HDR, "Referer": ref, ...(tk ? { "Authorization": "Bearer " + tk } : {}) } }); } catch { return ""; }
+    try { r = await upFetch(env, dom + "/wefeed-h5api-bff/subject/play?" + q, { headers: { ...MB_HDR, "Referer": ref, ...(tk ? { "Authorization": "Bearer " + tk } : {}) } }); } catch { return ""; }
     if ((r.status === 401 || r.status === 403) && a === 0) continue;
     let d; try { d = ((await r.json()) || {}).data || {}; } catch { return ""; }
     let u = "";
@@ -258,9 +427,9 @@ export default {
     let up = null;
     const tries = [], dbg = [];
     for (const [o, r, ae] of profiles) {
-      try { up = await fetch(u, { method: req.method, headers: mk(o, r, ae), redirect: "follow" }); }
+      try { up = await upFetch(env, u, { method: req.method, headers: mk(o, r, ae), redirect: "follow" }); }
       catch (e) { tries.push("err"); up = null; continue; }
-      tries.push(up.status + ":" + (up.headers.get("server") || "-") + (up.headers.get("cf-ray") ? "+ray" : ""));
+      tries.push(up.status + ":" + (up.headers.get("server") || "-") + (up.headers.get("cf-ray") ? "+ray" : "") + (up.viaProxy ? "+px" : ""));
       if (up.status < 400 || up.status === 416) break;
       if (env.DEBUG === "1") { try { dbg.push((await up.clone().text()).slice(0, 70).replace(/\s+/g, " ")); } catch {} }
       if (up.status === 429) break;                 // rate-limited: more tries only make it worse
