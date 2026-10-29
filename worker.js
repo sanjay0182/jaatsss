@@ -205,12 +205,29 @@ async function headOf(rd) {                    // -> {status, headers}
   }
   return { status: +m[1], headers };
 }
-function bodyOf(rd, head, close, method) {
+function bodyOf(rd, head, close, method, raw) {
   const st = head.status;
   if (method === "HEAD" || st === 204 || st === 304 || (st >= 100 && st < 200)) { close(); return null; }
   const chunked = /chunked/i.test(head.headers.get("transfer-encoding") || "");
   const cl = head.headers.get("content-length");
   let left = cl !== null && /^\d+$/.test(cl) ? +cl : -1;
+  if (!chunked && raw) {
+    // plain body (Content-Length or until close; we sent Connection: close): hand the socket bytes straight to the client.
+    // No JavaScript runs per chunk, so a long video does not use up the Worker's CPU-time limit.
+    let lead = rd.buf;
+    if (left >= 0 && lead.length > left) lead = lead.slice(0, left);
+    const src = raw();
+    rd.r.releaseLock();
+    const t = typeof IdentityTransformStream !== "undefined" ? new IdentityTransformStream() : new TransformStream();
+    (async () => {
+      try {
+        if (lead.length) { const w = t.writable.getWriter(); await w.write(lead); w.releaseLock(); }
+        await src.pipeTo(t.writable);
+      } catch { try { await t.writable.abort(); } catch {} }
+      finally { close(); }
+    })();
+    return t.readable;
+  }
   return new ReadableStream({
     async pull(c) {
       try {
@@ -281,7 +298,7 @@ async function proxyFetchOnce(px, url, init, hop) {
       close();
       return proxyFetchOnce(px, new URL(head.headers.get("location"), u).href, init, hop + 1);
     }
-    const resp = new Response(bodyOf(rd, head, close, method), { status: head.status, headers: head.headers });
+    const resp = new Response(bodyOf(rd, head, close, method, () => sock.readable), { status: head.status, headers: head.headers });
     Object.defineProperty(resp, "url", { value: u.href });
     Object.defineProperty(resp, "viaProxy", { value: true });
     return resp;
@@ -368,6 +385,61 @@ async function dbgInfo(req, up, u, bodies) {
   return o.join(" | ");
 }
 
+// ---- /t?k=<LINK_SECRET>: open in a browser. Runs the whole chain (token -> play link -> video bytes) FROM THE WORKER and says which step fails ----
+function pairsOf(o, out) {
+  if (o && typeof o === "object") {
+    if (o.subjectId && o.detailPath) out.push([String(o.subjectId), String(o.detailPath)]);
+    for (const v of Object.values(o)) pairsOf(v, out);
+  }
+}
+async function selfTest(req, env) {
+  const out = [], say = (x) => out.push(x);
+  const list = proxyList(env), api = env.MB_API || MB_API;
+  say("colo=" + ((req.cf && req.cf.colo) || "-") + " proxies=" + list.length + " mode=" + (env.PROXY_MODE || "always") + (typeof IdentityTransformStream !== "undefined" ? " streams=native" : ""));
+  const step = async (name, fn) => {
+    const t0 = Date.now();
+    try { say(name + ": " + (await fn()) + " (" + (Date.now() - t0) + "ms)"); return true; }
+    catch (e) { say(name + ": FAIL " + String((e && e.message) || e).replace(/[^\x20-\x7e]/g, "").slice(0, 150) + " (" + (Date.now() - t0) + "ms)"); return false; }
+  };
+  let tok = "", dom = "", home = {}, vid = "", ref = "";
+  await step("1 home/token", async () => {
+    const r = await upFetch(env, api + "/home?host=" + (env.MB_HOST || "moviebox.ph"), { headers: { ...MB_HDR, "Referer": "https://moviebox.ph/", "Origin": "https://moviebox.ph" } }, "t");
+    try { tok = JSON.parse(r.headers.get("x-user") || "{}").token || ""; } catch {}
+    try { home = JSON.parse(await r.text()); } catch {}
+    return r.status + (r.viaProxy ? " +px" : " direct") + " token=" + (tok ? "yes" : "NO");
+  });
+  if (tok) {
+    await step("2 domain", async () => {
+      const r = await upFetch(env, api + "/media-player/get-domain", { headers: { ...MB_HDR, "Authorization": "Bearer " + tok } }, "t");
+      const j = await r.json().catch(() => ({}));
+      dom = (typeof j.data === "string" ? j.data : "").replace(/\/+$/, "") || "https://netfilm.world";
+      return r.status + " " + dom;
+    });
+    const c = []; pairsOf(home, c);
+    say("movies in home: " + c.length);
+    for (const [sid, dp] of c.slice(0, 5)) {
+      if (vid) break;
+      await step("3 play " + dp.slice(0, 20), async () => {
+        ref = dom + "/spa/videoPlayPage/movies/" + dp + "?id=" + sid + "&type=/movie/detail&detailSe=0&detailEp=0&lang=en";
+        const r = await upFetch(env, dom + "/wefeed-h5api-bff/subject/play?subjectId=" + encodeURIComponent(sid) + "&se=0&ep=0&detailPath=" + encodeURIComponent(dp), { headers: { ...MB_HDR, "Referer": ref, "Authorization": "Bearer " + tok } }, "t");
+        const d = (((await r.json().catch(() => ({}))) || {}).data) || {};
+        const st = (d.streams || []).filter((x) => x && x.url), mp = st.filter((x) => !x.url.includes(".m3u8"));
+        vid = ((mp[0] || st[0] || {}).url) || "";
+        return r.status + " video=" + (vid ? new URL(vid).hostname : "none");
+      });
+    }
+    if (vid) {
+      await step("4 video 1MB", async () => {
+        const r = await upFetch(env, vid, { headers: { "User-Agent": UA, "Accept": "*/*", "Referer": dom + "/", "Origin": dom, "Range": "bytes=0-1048575" }, redirect: "follow" }, "t");
+        let n = 0;
+        if (r.body) { const rd = r.body.getReader(); for (;;) { const { value, done } = await rd.read(); if (done) break; n += value.length; if (n >= 1048576) { await rd.cancel(); break; } } }
+        return r.status + " server=" + (r.headers.get("server") || "-") + (r.viaProxy ? " +px" : " direct") + " bytes=" + n;
+      });
+    }
+  }
+  return new Response(out.join("\n") + "\n", { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
@@ -389,6 +461,10 @@ export default {
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
         "Access-Control-Allow-Headers": "Range, X-Device, X-Captcha, Content-Type",
         "Access-Control-Max-Age": "86400" } });
+    }
+    if (url.pathname === "/t") {
+      if (!env.LINK_SECRET || !same(url.searchParams.get("k") || "", env.LINK_SECRET)) return deny(403, "bad", cors);
+      return selfTest(req, env);
     }
     if (url.pathname !== "/p") return new Response("not found", { status: 404 });
     if (req.method !== "GET" && req.method !== "HEAD") return deny(405, "method", cors);
@@ -447,7 +523,7 @@ export default {
     const tries = [], dbg = [];
     for (const [o, r, ae] of profiles) {
       try { up = await upFetch(env, u, { method: req.method, headers: mk(o, r, ae), redirect: "follow" }, payload); }
-      catch (e) { tries.push("err"); up = null; continue; }
+      catch (e) { tries.push("err:" + String((e && e.message) || e).replace(/[^\x20-\x7e]/g, "").slice(0, 60)); up = null; continue; }
       tries.push(up.status + ":" + (up.headers.get("server") || "-") + (up.headers.get("cf-ray") ? "+ray" : "") + (up.viaProxy ? "+px" : ""));
       if (up.status < 400 || up.status === 416) break;
       if (env.DEBUG === "1") { try { dbg.push((await up.clone().text()).slice(0, 70).replace(/\s+/g, " ")); } catch {} }
