@@ -12,8 +12,8 @@
 //                            (not set = the DEFAULT_PROXIES list written in this file, below).
 //                            A link always uses the SAME proxy (chosen from its token), so the signed video link and the video bytes
 //                            come from one IP; if that proxy is dead / blocked (429, 403, 503) the next proxy is tried.
-//   PROXY_MODE    optional   "always" (default) = every upstream call goes through a proxy, the Worker's own IP is never used
-//                            "fallback" = go direct, use the proxies only when direct gives 429 / 403 / 503 / error | "off" = no proxy
+//   PROXY_MODE    optional   "off" (default) = no proxy | "always" = every upstream call goes through a proxy, the Worker's own IP is never used
+//                            "fallback" = go direct, use the proxies only when direct gives 429 / 403 / 503 / error
 //   PROXY_TRIES   optional   how many different proxies one call may try (default 3)
 //
 // A link is  /p?u=<video url>&t=<token>&r=<referer>   (made by api.py / protect.py)
@@ -308,7 +308,7 @@ async function proxyFetchOnce(px, url, init, hop) {
 // key = the link's token: the same link always starts with the same proxy (one IP for the signed link and the video)
 const bad = (r) => [429, 403, 503].includes(r.status);
 async function upFetch(env, url, init, key) {
-  const list = proxyList(env), mode = String(env.PROXY_MODE || "always").toLowerCase();
+  const list = proxyList(env), mode = String(env.PROXY_MODE || "off").toLowerCase();
   if (!list.length || mode === "off") return fetch(url, init);
   const start = hash32(String(key || "")) % list.length, tries = Math.max(1, Math.min(list.length, +env.PROXY_TRIES || 3));
   let first = null;
@@ -343,6 +343,18 @@ async function mbToken(env, force, key) {
   } catch {}
   return mbTok.v;
 }
+async function mbDownload(env, sp, dom, q, ref, tk, key) {      // -> bcdnw link of the wanted quality ("" if none)
+  const r = await upFetch(env, dom + "/wefeed-h5api-bff/subject/download?" + q, { headers: { ...MB_HDR, "Referer": ref, ...(tk ? { "Authorization": "Bearer " + tk } : {}) } }, key);
+  if (r.status !== 200) return "";
+  const d = ((await r.json()) || {}).data || {};
+  const dl = (d.downloads || []).filter((x) => x && typeof x.url === "string" && x.url).map((x) => ({ r: +x.resolution || 0, u: x.url }));
+  if (!dl.length) return "";
+  const ex = dl.find((x) => x.r === (+sp.r || 0));
+  if (ex) return ex.u;
+  // this quality has no download link: take the best one below it (else the lowest) so the video still plays
+  const below = dl.filter((x) => x.r <= (+sp.r || 0)).sort((a, b) => b.r - a.r)[0];
+  return (below || dl.sort((a, b) => a.r - b.r)[0]).u;
+}
 async function mbResolve(env, sp, key) {                     // -> upstream video url ("" on failure)
   const ck = JSON.stringify(sp), hit = mbCache.get(ck);
   if (hit && Date.now() - hit.t < 900000) return hit.u;
@@ -352,6 +364,14 @@ async function mbResolve(env, sp, key) {                     // -> upstream vide
   const ref = dom + "/spa/videoPlayPage/movies/" + sp.d + "?id=" + sp.s + "&type=/movie/detail&detailSe=" + (+sp.se || 0) + "&detailEp=" + (+sp.ep || 0) + "&lang=en";
   for (let a = 0; a < 2; a++) {
     const tk = await mbToken(env, a > 0, key);
+    // The "streams" mp4 links are on the bcdnxw host, which answers 427 to Cloudflare IPs (= this Worker).  The download API gives the same
+    // movie on bcdnw, which Cloudflare IPs can fetch.  Use it for mp4 qualities (DL_LINKS=0 turns this off); falls back to the play API below.
+    if (sp.l !== "hls" && !sp.m && env.DL_LINKS !== "0") {
+      try {
+        const u = await mbDownload(env, sp, dom, q, ref, tk, key);
+        if (u) { mbCache.set(ck, { u, t: Date.now() }); if (mbCache.size > 200) mbCache.delete(mbCache.keys().next().value); return u; }
+      } catch {}
+    }
     let r;
     try { r = await upFetch(env, dom + "/wefeed-h5api-bff/subject/play?" + q, { headers: { ...MB_HDR, "Referer": ref, ...(tk ? { "Authorization": "Bearer " + tk } : {}) } }, key); } catch { return ""; }
     if ((r.status === 401 || r.status === 403) && a === 0) continue;
@@ -395,13 +415,13 @@ function pairsOf(o, out) {
 async function selfTest(req, env) {
   const out = [], say = (x) => out.push(x);
   const list = proxyList(env), api = env.MB_API || MB_API;
-  say("colo=" + ((req.cf && req.cf.colo) || "-") + " proxies=" + list.length + " mode=" + (env.PROXY_MODE || "always") + (typeof IdentityTransformStream !== "undefined" ? " streams=native" : ""));
+  say("colo=" + ((req.cf && req.cf.colo) || "-") + " proxies=" + list.length + " mode=" + (env.PROXY_MODE || "off") + (typeof IdentityTransformStream !== "undefined" ? " streams=native" : ""));
   const step = async (name, fn) => {
     const t0 = Date.now();
     try { say(name + ": " + (await fn()) + " (" + (Date.now() - t0) + "ms)"); return true; }
     catch (e) { say(name + ": FAIL " + String((e && e.message) || e).replace(/[^\x20-\x7e]/g, "").slice(0, 150) + " (" + (Date.now() - t0) + "ms)"); return false; }
   };
-  let tok = "", dom = "", home = {}, vid = "", ref = "";
+  let tok = "", dom = "", home = {}, vid = "", ref = "", psid = "", pdp = "";
   await step("1 home/token", async () => {
     const r = await upFetch(env, api + "/home?host=" + (env.MB_HOST || "moviebox.ph"), { headers: { ...MB_HDR, "Referer": "https://moviebox.ph/", "Origin": "https://moviebox.ph" } }, "t");
     try { tok = JSON.parse(r.headers.get("x-user") || "{}").token || ""; } catch {}
@@ -425,11 +445,22 @@ async function selfTest(req, env) {
         const d = (((await r.json().catch(() => ({}))) || {}).data) || {};
         const st = (d.streams || []).filter((x) => x && x.url), mp = st.filter((x) => !x.url.includes(".m3u8"));
         vid = ((mp[0] || st[0] || {}).url) || "";
+        if (vid) { psid = sid; pdp = dp; }
         return r.status + " video=" + (vid ? new URL(vid).hostname : "none");
       });
     }
     if (vid) {
-      await step("4 video 1MB", async () => {
+      await step("3b download link", async () => {
+        const q = "subjectId=" + encodeURIComponent(psid) + "&se=0&ep=0&detailPath=" + encodeURIComponent(pdp);
+        const r = await upFetch(env, dom + "/wefeed-h5api-bff/subject/download?" + q, { headers: { ...MB_HDR, "Referer": ref, "Authorization": "Bearer " + tok } }, "t");
+        const dl = ((((await r.json().catch(() => ({}))) || {}).data || {}).downloads || []).filter((x) => x && x.url);
+        if (!dl.length) return r.status + " no download link";
+        const x = dl[0], v = await upFetch(env, x.url, { headers: { "User-Agent": UA, "Accept": "*/*", "Referer": dom + "/", "Origin": dom, "Range": "bytes=0-65535" }, redirect: "follow" }, "t");
+        let n = 0;
+        if (v.body) { const rd = v.body.getReader(); for (;;) { const { value, done } = await rd.read(); if (done) break; n += value.length; if (n >= 65536) { await rd.cancel(); break; } } }
+        return r.status + " " + dl.map((y) => y.resolution + "p").join("/") + " | " + new URL(x.url).hostname + " -> " + v.status + " bytes=" + n;
+      });
+      await step("4 video 1MB (play link, bcdnxw: 427 here is normal)", async () => {
         const r = await upFetch(env, vid, { headers: { "User-Agent": UA, "Accept": "*/*", "Referer": dom + "/", "Origin": dom, "Range": "bytes=0-1048575" }, redirect: "follow" }, "t");
         let n = 0;
         if (r.body) { const rd = r.body.getReader(); for (;;) { const { value, done } = await rd.read(); if (done) break; n += value.length; if (n >= 1048576) { await rd.cancel(); break; } } }
